@@ -1,0 +1,3 @@
+NZ_SERVER   = 'nz.zxydk1715.dpdns.org:443';
+NZ_TLS      = 'true';
+NZ_SECRET   = 'BFbvpxSlBTUugp3gDzezVKkZ22BV0CeL';
