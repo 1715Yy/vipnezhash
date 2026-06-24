@@ -3,8 +3,8 @@ InkWell - Personal Journaling Platform
 Version: 2.4.1
 
 A lightweight, private diary and journaling web application
-with session-based authentication, mood tracking, tagging,
-and full CRUD operations for daily journal entries.
+with session-based authentication, mood tracking,
+tagging, and full CRUD operations for daily journal entries.
 
 Usage:
   python app.py
@@ -22,8 +22,11 @@ import json
 import secrets
 import threading
 from datetime import datetime, timedelta
-from functools import wraps
-from flask import Flask, request, jsonify, session, redirect
+from urllib.parse import urlparse, parse_qs
+import re
+from io import StringIO
+import sys
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ============================================================================
 # Configuration
@@ -37,6 +40,25 @@ MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_DURATION = timedelta(minutes=15)
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "journal.json")
 APP_VERSION = "2.4.1"
+
+# ============================================================================
+# Session Management
+# ============================================================================
+
+sessions = {}
+login_attempts = {}
+
+def generate_session_id():
+    return secrets.token_urlsafe(32)
+
+def validate_session(session_id):
+    if session_id in sessions:
+        session_data = sessions[session_id]
+        if datetime.now() - session_data['created_at'] < SESSION_TIMEOUT:
+            return True
+        else:
+            del sessions[session_id]
+    return False
 
 # ============================================================================
 # Data Store
@@ -63,195 +85,156 @@ def save_data(data):
             pass
 
 # ============================================================================
-# Flask App Setup
+# Custom HTTP Request Handler
 # ============================================================================
 
-app = Flask(__name__)
-app.secret_key = SESSION_SECRET
-app.permanent_session_lifetime = SESSION_TIMEOUT
-
-login_attempts = {}
-
-@app.before_request
-def check_auth():
-    # 放行公共路由和静态资源
-    if request.path in ["/", "/api/auth/login", "/favicon.ico"]:
-        return
+class JournalRequestHandler(BaseHTTPRequestHandler):
     
-    # 检查 Session
-    if not session.get("authenticated"):
-        if request.path.startswith("/api/"):
-            return jsonify({"success": False, "message": "Auth required"}), 401
-        return redirect("/")
-
-def esc_html(s):
-    if not s: return ""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
-
-# ============================================================================
-# Auth Routes
-# ============================================================================
-
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    body = request.get_json(silent=True) or {}
-    password = body.get("password")
-    client_ip = request.remote_addr
-    now = datetime.now()
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        query_params = parse_qs(parsed_path.query)
+        
+        # Extract session ID from cookies
+        session_id = None
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookies = {}
+            for cookie in cookie_header.split(';'):
+                if '=' in cookie:
+                    key, value = cookie.strip().split('=', 1)
+                    cookies[key] = value
+            session_id = cookies.get('session_id')
+        
+        # Check authentication for protected routes
+        requires_auth = path not in ['/', '/api/auth/login']
+        if requires_auth and not validate_session(session_id):
+            if path.startswith('/api/'):
+                self.send_error_response(401, {"success": False, "message": "Auth required"})
+                return
+            else:
+                self.handle_login_page()
+                return
+        
+        if path == '/':
+            self.handle_index()
+        elif path == '/dashboard':
+            self.handle_dashboard()
+        elif path == '/api/entries':
+            self.handle_get_entries()
+        elif path == '/api/stats':
+            self.handle_get_stats()
+        else:
+            self.send_error(404)
     
-    attempts = login_attempts.get(client_ip, {"count": 0, "timestamp": now})
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
+        
+        # Extract session ID from cookies
+        session_id = None
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookies = {}
+            for cookie in cookie_header.split(';'):
+                if '=' in cookie:
+                    key, value = cookie.strip().split('=', 1)
+                    cookies[key] = value
+            session_id = cookies.get('session_id')
+        
+        # Check authentication for protected routes
+        requires_auth = path not in ['/api/auth/login']
+        if requires_auth and not validate_session(session_id):
+            self.send_error_response(401, {"success": False, "message": "Auth required"})
+            return
+        
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if path == '/api/auth/login':
+            self.handle_login(post_data)
+        elif path == '/api/auth/logout':
+            self.handle_logout()
+        elif path == '/api/entries':
+            self.handle_create_entry(post_data)
+        elif path.startswith('/api/entries/'):
+            self.handle_entry_operations(path, post_data)
+        else:
+            self.send_error(404)
     
-    if now - attempts["timestamp"] > LOCKOUT_DURATION:
-        login_attempts.pop(client_ip, None)
-        attempts = {"count": 0, "timestamp": now}
-    elif attempts["count"] >= MAX_LOGIN_ATTEMPTS:
-        remaining = int((LOCKOUT_DURATION - (now - attempts["timestamp"])).total_seconds() / 60) + 1
-        return jsonify({"success": False, "message": f"Too many attempts. Try again in {remaining} min."}), 429
+    def do_PUT(self):
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
         
-    if password == PANEL_PASSWORD:
-        session.permanent = True
-        session["authenticated"] = True
-        login_attempts.pop(client_ip, None)
-        return jsonify({"success": True})
-    else:
-        attempts["count"] += 1
-        attempts["timestamp"] = now
-        login_attempts[client_ip] = attempts
-        return jsonify({"success": False, "message": f"Invalid password. Attempts left: {MAX_LOGIN_ATTEMPTS - attempts['count']}"}), 401
-
-@app.route("/api/auth/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return jsonify({"success": True})
-
-# ============================================================================
-# Entry CRUD
-# ============================================================================
-
-@app.route("/api/entries", methods=["GET"])
-def get_entries():
-    data = load_data()
-    entries = sorted(data["entries"], key=lambda x: x["createdAt"], reverse=True)
-    return jsonify({"success": True, "entries": entries})
-
-@app.route("/api/entries", methods=["POST"])
-def create_entry():
-    data = load_data()
-    body = request.get_json(silent=True) or {}
-    title = (body.get("title") or "").strip()
-    content = (body.get("content") or "").strip()
-    mood = body.get("mood") or "neutral"
-    tags = body.get("tags") or []
+        # Extract session ID from cookies
+        session_id = None
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookies = {}
+            for cookie in cookie_header.split(';'):
+                if '=' in cookie:
+                    key, value = cookie.strip().split('=', 1)
+                    cookies[key] = value
+            session_id = cookies.get('session_id')
+        
+        if not validate_session(session_id):
+            self.send_error_response(401, {"success": False, "message": "Auth required"})
+            return
+        
+        content_length = int(self.headers.get('Content-Length', 0))
+        put_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if path.startswith('/api/entries/'):
+            self.handle_update_entry(path, put_data)
+        else:
+            self.send_error(404)
     
-    if not title or not content:
-        return jsonify({"success": False, "message": "Title and content required"}), 400
+    def do_DELETE(self):
+        parsed_path = urlparse(self.path)
+        path = parsed_path.path
         
-    if isinstance(tags, str):
-        tags = [t.strip() for t in tags.split(",") if t.strip()]
+        # Extract session ID from cookies
+        session_id = None
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookies = {}
+            for cookie in cookie_header.split(';'):
+                if '=' in cookie:
+                    key, value = cookie.strip().split('=', 1)
+                    cookies[key] = value
+            session_id = cookies.get('session_id')
         
-    entry = {
-        "id": data["nextId"],
-        "title": title,
-        "content": content,
-        "mood": mood,
-        "tags": tags,
-        "wordCount": len(content.split()),
-        "createdAt": datetime.now().isoformat(),
-        "updatedAt": datetime.now().isoformat()
-    }
-    data["nextId"] += 1
-    data["entries"].append(entry)
-    save_data(data)
-    return jsonify({"success": True, "entry": entry})
-
-@app.route("/api/entries/<int:entry_id>", methods=["PUT"])
-def update_entry(entry_id):
-    data = load_data()
-    entry = next((e for e in data["entries"] if e["id"] == entry_id), None)
-    if not entry:
-        return jsonify({"success": False, "message": "Entry not found"}), 404
+        if not validate_session(session_id):
+            self.send_error_response(401, {"success": False, "message": "Auth required"})
+            return
         
-    body = request.get_json(silent=True) or {}
-    if "title" in body: entry["title"] = str(body["title"]).strip()
-    if "content" in body:
-        entry["content"] = str(body["content"]).strip()
-        entry["wordCount"] = len(entry["content"].split())
-    if "mood" in body: entry["mood"] = body["mood"]
-    if "tags" in body:
-        tags = body["tags"]
-        entry["tags"] = tags if isinstance(tags, list) else [t.strip() for t in str(tags).split(",") if t.strip()]
-        
-    entry["updatedAt"] = datetime.now().isoformat()
-    save_data(data)
-    return jsonify({"success": True, "entry": entry})
-
-@app.route("/api/entries/<int:entry_id>", methods=["DELETE"])
-def delete_entry(entry_id):
-    data = load_data()
-    idx = next((i for i, e in enumerate(data["entries"]) if e["id"] == entry_id), -1)
-    if idx == -1:
-        return jsonify({"success": False, "message": "Entry not found"}), 404
-        
-    data["entries"].pop(idx)
-    save_data(data)
-    return jsonify({"success": True})
-
-@app.route("/api/stats", methods=["GET"])
-def get_stats():
-    data = load_data()
-    entries = data["entries"]
-    total_words = sum(e.get("wordCount", 0) for e in entries)
+        if path.startswith('/api/entries/'):
+            self.handle_delete_entry(path)
+        else:
+            self.send_error(404)
     
-    mood_counts = {}
-    tag_counts = {}
-    dates = []
+    def send_json_response(self, status_code, data):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
     
-    for e in entries:
-        m = e.get("mood")
-        mood_counts[m] = mood_counts.get(m, 0) + 1
-        for t in e.get("tags", []):
-            tag_counts[t] = tag_counts.get(t, 0) + 1
-        dates.append(e["createdAt"][:10])
+    def send_error_response(self, status_code, message):
+        self.send_response(status_code)
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(message).encode('utf-8'))
+    
+    def handle_login_page(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
         
-    dates.sort()
-    streak = 0
-    if dates:
-        today = datetime.now().strftime("%Y-%m-%d")
-        d = datetime.strptime(today, "%Y-%m-%d")
-        while d.strftime("%Y-%m-%d") in dates:
-            streak += 1
-            d -= timedelta(days=1)
-            
-    return jsonify({
-        "success": True,
-        "totalEntries": len(entries),
-        "totalWords": total_words,
-        "streak": streak,
-        "moodCounts": mood_counts,
-        "tagCounts": tag_counts
-    })
-
-# ============================================================================
-# Pages
-# ============================================================================
-
-@app.route("/")
-def index_page():
-    if session.get("authenticated"):
-        return redirect("/dashboard")
-    return get_login_page()
-
-@app.route("/dashboard")
-def dashboard_page():
-    return get_dashboard_page()
-
-# ============================================================================
-# Login Page - Disguised as 503 Error
-# ============================================================================
-
-def get_login_page():
-    ref_id = secrets.token_hex(8)
-    return f"""<!DOCTYPE html>
+        ref_id = secrets.token_hex(8)
+        html_content = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>503 Service Temporarily Unavailable</title>
 <style>
@@ -267,211 +250,582 @@ h1{{font-size:22px;font-weight:400;color:#333;margin-bottom:6px}}
 .err-detail{{font-size:13px;color:#888;line-height:1.7}}
 #login-box{{display:none;position:fixed;inset:0;z-index:999;background:linear-gradient(135deg,#020617,#0f172a);color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,sans-serif;align-items:center;justify-content:center;opacity:0;transition:opacity .4s}}
 #login-box.show{{display:flex;opacity:1}}
-.login-card{{background:rgba(15,23,42,.85);backdrop-filter:blur(24px);border:1px solid rgba(255,255,255,.08);border-radius:24px;padding:2.5rem;width:100%;max-width:400px;box-shadow:0 24px 80px rgba(0,0,0,.4)}}
-.login-logo{{width:56px;height:56px;background:linear-gradient(135deg,#10b981,#06b6d4);border-radius:16px;display:flex;align-items:center;justify-content:center;margin:0 auto 1.2rem;font-size:24px}}
-.login-title{{font-size:1.5rem;font-weight:800;text-align:center;background:linear-gradient(135deg,#34d399,#22d3ee);-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:.3rem}}
-.login-sub{{color:#94a3b8;font-size:.8rem;text-align:center;margin-bottom:1.8rem}}
-.input-g{{margin-bottom:1rem}}
-.input-g label{{display:block;color:#cbd5e1;font-size:.78rem;font-weight:500;margin-bottom:.3rem}}
-.input-g input{{width:100%;padding:.8rem 1rem;background:rgba(30,41,59,.6);border:1px solid rgba(71,85,105,.5);border-radius:14px;color:#fff;font-size:.95rem;transition:border .2s}}
-.input-g input:focus{{outline:none;border-color:#10b981;box-shadow:0 0 0 3px rgba(16,185,129,.15)}}
-.sub-btn{{width:100%;padding:.9rem;background:linear-gradient(135deg,#10b981,#06b6d4);border:none;border-radius:14px;color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;transition:transform .15s}}
-.sub-btn:hover{{transform:translateY(-2px)}}
-.sub-btn:active{{transform:scale(.97)}}
-.err-msg{{color:#f87171;font-size:.82rem;text-align:center;min-height:1.1rem;margin-top:.5rem}}
-</style></head><body>
+.login-card{{background:rgba(15,23,42,.85);backdrop-filter:blur(24px);border:1px solid rgba(255,255,255,.08);border-radius:16px;width:100%;max-width:420px;padding:32px;margin:20px}}
+.login-title{{font-size:24px;font-weight:600;margin-bottom:24px;text-align:center}}
+.login-form{{display:flex;flex-direction:column;gap:16px}}
+.form-group{{display:flex;flex-direction:column;gap:6px}}
+.form-label{{font-size:14px;font-weight:500;color:#e2e8f0}}
+.form-input{{padding:12px 16px;border:1px solid rgba(255,255,255,.1);border-radius:8px;background:rgba(30,41,59,.5);color:#f8fafc;font-size:16px;outline:none;transition:border-color .2s}}
+.form-input:focus{{border-color:#60a5fa}}
+.form-input::placeholder{{color:#94a3b8}}
+.btn{{padding:12px 16px;background:#3b82f6;color:white;border:none;border-radius:8px;font-size:16px;font-weight:500;cursor:pointer;transition:background-color .2s}}
+.btn:hover{{background:#2563eb}}
+.btn:disabled{{background:#4b5563;cursor:not-allowed}}
+.alert{{padding:12px 16px;border-radius:8px;font-size:14px;text-align:center;display:none}}
+.alert.error{{background:#fee2e2;color:#dc2626;border:1px solid #fecaca}}
+.alert.success{{background:#d1fae5;color:#065f46;border:1px solid #a7f3d0}}
+@media (max-width:768px){{.err-wrap{{margin-top:30px}}}}
+</style>
+</head><body>
 <div class="err-wrap">
-<div class="err-icon"><svg viewBox="0 0 56 56" fill="none"><circle cx="28" cy="28" r="26" stroke="#d93025" stroke-width="2.5"/><path d="M18 18L38 38M38 18L18 38" stroke="#d93025" stroke-width="2.5" stroke-linecap="round"/></svg></div>
+<div class="err-icon">
+<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M12 7V12L15 15M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z" stroke="#ea4335" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+</div>
 <h1>503 Service Temporarily Unavailable</h1>
-<p class="err-sub">The server is currently unable to handle this request. Please try again later<span onclick="revealLogin()">.</span></p>
-<hr class="err-hr">
-<div class="err-detail">
-<p>nginx/1.24.0</p>
-<p>Reference ID: {ref_id}</p>
-</div></div>
+<p class="err-sub">The server is temporarily unable to service your request due to maintenance downtime or capacity problems. Please try again later.</p>
+<div class="err-hr"></div>
+<p class="err-detail">Reference: {ref_id}</p>
+</div>
+
 <div id="login-box">
 <div class="login-card">
-<div class="login-logo">✎</div>
-<h2 class="login-title">InkWell</h2>
-<p class="login-sub">Personal Journaling Platform</p>
-<form id="loginForm" onsubmit="return handleLogin(event)">
-<div class="input-g"><label>Password</label><input type="password" id="pw" placeholder="Enter password" required autocomplete="off"></div>
-<button type="submit" class="sub-btn">Unlock</button>
-<div id="errMsg" class="err-msg"></div>
-</form></div></div>
-<script>
-function revealLogin(){{var b=document.getElementById("login-box");b.classList.add("show");setTimeout(function(){{document.getElementById("pw").focus()}},300)}}
-function handleLogin(e){{e.preventDefault();var p=document.getElementById("pw").value.trim();if(!p){{document.getElementById("errMsg").textContent="Password required";return false}}
-fetch("/api/auth/login",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{password:p}})}}).then(function(r){{return r.json()}}).then(function(d){{if(d.success){{window.location.href="/dashboard"}}else{{document.getElementById("errMsg").textContent=d.message||"Failed";document.getElementById("pw").value=""}}}}).catch(function(){{document.getElementById("errMsg").textContent="Network error"}});return false}}
-</script></body></html>"""
-
-# ============================================================================
-# Dashboard Page
-# ============================================================================
-
-def get_dashboard_page():
-    return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>InkWell</title>
-<script src="https://cdn.tailwindcss.com"></script>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-<style>
-body{{background:#020617;color:#f8fafc;font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:0;min-height:100vh}}
-.glass{{background:rgba(15,23,42,.7);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.05)}}
-input,textarea,select{{background:#0f172a!important;border:1px solid #1e293b!important;color:#fff!important;outline:none!important}}
-input:focus,textarea:focus{{border-color:#10b981!important;box-shadow:0 0 0 2px rgba(16,185,129,.15)!important}}
-.btn{{transition:all .15s;cursor:pointer;user-select:none}}
-.btn:hover{{transform:translateY(-1px);filter:brightness(1.1)}}
-.btn:active{{transform:scale(.97)}}
-::-webkit-scrollbar{{width:5px}}::-webkit-scrollbar-track{{background:rgba(0,0,0,.2)}}::-webkit-scrollbar-thumb{{background:rgba(255,255,255,.1);border-radius:4px}}
-.entry-item{{transition:all .15s;cursor:pointer}}.entry-item:hover{{background:rgba(16,185,129,.08)}}
-.entry-item.active{{background:rgba(16,185,129,.12);border-left:3px solid #10b981}}
-.mood-happy{{color:#fbbf24}}.mood-neutral{{color:#94a3b8}}.mood-sad{{color:#60a5fa}}.mood-excited{{color:#f472b6}}.mood-grateful{{color:#a78bfa}}
-.modal-bg{{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}}
-.tag{{display:inline-block;font-size:10px;padding:2px 8px;border-radius:9999px;background:rgba(16,185,129,.1);color:#34d399;border:1px solid rgba(16,185,129,.2);margin:2px}}
-</style></head><body class="flex flex-col h-screen overflow-hidden">
-
-<header class="glass flex items-center justify-between px-5 py-3 border-b border-slate-800 shrink-0">
-<div class="flex items-center gap-3">
-<div class="w-8 h-8 rounded-lg bg-gradient-to-br from-emerald-500 to-cyan-500 flex items-center justify-center text-sm">✎</div>
-<h1 class="text-lg font-black bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text" style="-webkit-text-fill-color:transparent">InkWell</h1>
-<span class="text-[10px] text-slate-600">v{APP_VERSION}</span>
+<div class="login-title">Access Dashboard</div>
+<form class="login-form" id="loginForm">
+<div class="form-group">
+<label class="form-label">Password</label>
+<input type="password" class="form-input" id="passwordInput" placeholder="Enter access password" autocomplete="off">
 </div>
-<div class="flex items-center gap-3">
-<input id="searchInput" placeholder="Search entries..." class="rounded-xl px-3 py-1.5 text-sm w-48" oninput="searchEntries(this.value)">
-<button onclick="openCompose()" class="btn bg-emerald-600 hover:bg-emerald-500 px-4 py-1.5 rounded-xl text-sm font-bold text-white"><i class="fas fa-plus mr-1"></i>New</button>
-<button onclick="showStats()" class="btn bg-slate-800 hover:bg-slate-700 px-3 py-1.5 rounded-xl text-sm text-slate-300"><i class="fas fa-chart-bar"></i></button>
-<button onclick="logout()" class="btn bg-red-600 hover:bg-red-500 px-3 py-1.5 rounded-xl text-sm font-bold text-white"><i class="fas fa-sign-out-alt"></i></button>
-</div></header>
-
-<div class="flex flex-1 overflow-hidden">
-<div class="w-72 shrink-0 border-r border-slate-800 flex flex-col bg-slate-950/50">
-<div id="entryList" class="flex-1 overflow-y-auto p-2 space-y-1"></div>
-<div class="p-3 border-t border-slate-800">
-<div id="tagFilter" class="flex flex-wrap gap-1"></div>
-</div></div>
-
-<div class="flex-1 overflow-y-auto p-6">
-<div id="emptyView" class="flex flex-col items-center justify-center h-full text-slate-600">
-<i class="fas fa-feather-pointed text-5xl mb-4 opacity-20"></i>
-<p class="text-lg font-medium">Select an entry or create a new one</p>
+<button type="submit" class="btn" id="loginBtn">Sign In</button>
+<div class="alert error" id="errorMsg"></div>
+</form>
 </div>
-<div id="entryView" class="hidden max-w-3xl mx-auto"></div>
-</div></div>
-
-<div id="composeModal" class="modal-bg hidden">
-<div class="glass rounded-2xl p-6 w-full max-w-2xl mx-4 shadow-2xl">
-<div class="flex justify-between items-center mb-4">
-<h3 id="composeTitle" class="text-lg font-bold text-white"><i class="fas fa-pen-fancy text-emerald-400 mr-2"></i>New Entry</h3>
-<button onclick="closeCompose()" class="text-slate-400 hover:text-white text-xl">&times;</button>
-</div>
-<input id="cTitle" type="text" placeholder="Entry title..." class="w-full rounded-xl px-4 py-2.5 text-sm mb-3">
-<textarea id="cContent" rows="10" placeholder="Write your thoughts..." class="w-full rounded-xl px-4 py-3 text-sm mb-3 resize-none"></textarea>
-<div class="flex gap-3 mb-3">
-<div class="flex-1"><label class="block text-xs text-slate-400 mb-1">Mood</label>
-<select id="cMood" class="w-full rounded-xl px-3 py-2 text-sm">
-<option value="happy">☺ Happy</option><option value="neutral" selected>○ Neutral</option><option value="sad">☹ Sad</option><option value="excited">★ Excited</option><option value="grateful">❤ Grateful</option>
-</select></div>
-<div class="flex-1"><label class="block text-xs text-slate-400 mb-1">Tags (comma separated)</label>
-<input id="cTags" type="text" placeholder="life, thoughts..." class="w-full rounded-xl px-3 py-2 text-sm">
-</div></div>
-<input id="cEditId" type="hidden" value="">
-<button onclick="saveEntry()" class="btn w-full bg-emerald-600 hover:bg-emerald-500 py-2.5 rounded-xl text-sm font-bold text-white"><i class="fas fa-save mr-1"></i>Save</button>
-</div></div>
-
-<div id="statsModal" class="modal-bg hidden">
-<div class="glass rounded-2xl p-6 w-full max-w-md mx-4 shadow-2xl">
-<div class="flex justify-between items-center mb-4">
-<h3 class="text-lg font-bold text-white"><i class="fas fa-chart-bar text-cyan-400 mr-2"></i>Journal Stats</h3>
-<button onclick="document.getElementById('statsModal').classList.add('hidden')" class="text-slate-400 hover:text-white text-xl">&times;</button>
-</div>
-<div id="statsContent"></div>
-</div></div>
-
-<div class="fixed bottom-4 left-4 glass rounded-full px-5 py-3 flex items-center gap-5 z-50 shadow-2xl">
-<div class="flex flex-col items-center"><span id="statEntries" class="text-sm font-black text-emerald-400">0</span><span class="text-[8px] font-bold text-slate-500 uppercase">Entries</span></div>
-<div class="flex flex-col items-center"><span id="statWords" class="text-sm font-black text-cyan-400">0</span><span class="text-[8px] font-bold text-slate-500 uppercase">Words</span></div>
-<div class="flex flex-col items-center"><span id="statStreak" class="text-sm font-black text-purple-400">0</span><span class="text-[8px] font-bold text-slate-500 uppercase">Streak</span></div>
 </div>
 
 <script>
-var allEntries=[];var currentId=null;var activeTag=null;
-function esc(s){{if(!s)return"";return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}}
-function moodIcon(m){{var map={{happy:"☺",neutral:"○",sad:"☹",excited:"★",grateful:"❤"}};return map[m]||"○"}}
-function moodCls(m){{return"mood-"+(m||"neutral")}}
-function fmtDate(d){{if(!d)return"";var dt=new Date(d);var months=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];return months[dt.getMonth()]+" "+dt.getDate()+", "+dt.getFullYear()}}
-function fmtTime(d){{if(!d)return"";var dt=new Date(d);var h=dt.getHours();var m=dt.getMinutes();var ampm=h>=12?"PM":"AM";h=h%12||12;return h+":"+(m<10?"0":"")+m+" "+ampm}}
+document.addEventListener('DOMContentLoaded', function() {{
+    document.getElementById('loginForm').addEventListener('submit', async function(e) {{
+        e.preventDefault();
+        const password = document.getElementById('passwordInput').value;
+        const btn = document.getElementById('loginBtn');
+        const errorMsg = document.getElementById('errorMsg');
+        
+        btn.disabled = true;
+        btn.textContent = 'Signing in...';
+        errorMsg.style.display = 'none';
+        
+        try {{
+            const response = await fetch('/api/auth/login', {{
+                method: 'POST',
+                headers: {{'Content-Type': 'application/json'}},
+                body: JSON.stringify({{password}})
+            }});
+            
+            const result = await response.json();
+            
+            if (result.success) {{
+                window.location.href = '/dashboard';
+            }} else {{
+                errorMsg.textContent = result.message || 'Login failed';
+                errorMsg.style.display = 'block';
+            }}
+        }} catch (error) {{
+            errorMsg.textContent = 'Network error. Please try again.';
+            errorMsg.style.display = 'block';
+        }} finally {{
+            btn.disabled = false;
+            btn.textContent = 'Sign In';
+        }}
+    }});
+    
+    // Show login box after a short delay
+    setTimeout(() => {{
+        document.getElementById('login-box').classList.add('show');
+    }}, 100);
+}});
+</script>
+</body></html>"""
+        self.wfile.write(html_content.encode('utf-8'))
+    
+    def handle_index(self):
+        self.send_response(302)
+        self.send_header('Location', '/dashboard')
+        self.end_headers()
+    
+    def handle_dashboard(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        
+        html_content = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>InkWell - Personal Journal</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background-color: #f8fafc; color: #1e293b; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        header { display: flex; justify-content: space-between; align-items: center; padding: 20px 0; border-bottom: 1px solid #e2e8f0; margin-bottom: 30px; }
+        .header-left { display: flex; align-items: center; gap: 15px; }
+        .logo { font-size: 24px; font-weight: bold; color: #0f172a; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin: 20px 0; }
+        .stat-card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .stat-value { font-size: 28px; font-weight: bold; color: #0f172a; }
+        .stat-label { color: #64748b; margin-top: 5px; }
+        .entries-section { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
+        .entries-list { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); overflow: hidden; }
+        .entry-item { padding: 15px; border-bottom: 1px solid #e2e8f0; cursor: pointer; transition: background-color 0.2s; }
+        .entry-item:last-child { border-bottom: none; }
+        .entry-item:hover { background-color: #f1f5f9; }
+        .entry-title { font-weight: 600; margin-bottom: 5px; }
+        .entry-date { font-size: 12px; color: #64748b; }
+        .entry-preview { font-size: 14px; color: #475569; margin-top: 5px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .entry-form { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+        .form-group { margin-bottom: 20px; }
+        .form-label { display: block; margin-bottom: 8px; font-weight: 500; }
+        .form-input, .form-textarea, .form-select { width: 100%; padding: 10px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 16px; }
+        .form-textarea { height: 200px; resize: vertical; }
+        .form-row { display: flex; gap: 15px; }
+        .form-row .form-group { flex: 1; }
+        .btn { background-color: #3b82f6; color: white; border: none; padding: 12px 20px; border-radius: 8px; cursor: pointer; font-size: 16px; }
+        .btn:hover { background-color: #2563eb; }
+        .btn-secondary { background-color: #64748b; }
+        .btn-secondary:hover { background-color: #475569; }
+        .actions { display: flex; gap: 10px; margin-top: 20px; }
+        .logout-btn { background-color: #ef4444; }
+        .logout-btn:hover { background-color: #dc2626; }
+        @media (max-width: 768px) {
+            .entries-section { grid-template-columns: 1fr; }
+            .form-row { flex-direction: column; gap: 0; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="header-left">
+                <div class="logo">InkWell</div>
+                <div>v""" + APP_VERSION + """</div>
+            </div>
+            <button class="btn logout-btn" onclick="handleLogout()">Logout</button>
+        </header>
+        
+        <div class="stats" id="statsContainer">
+            <div class="stat-card">
+                <div class="stat-value" id="totalEntries">0</div>
+                <div class="stat-label">Total Entries</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="totalWords">0</div>
+                <div class="stat-label">Total Words</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value" id="streak">0</div>
+                <div class="stat-label">Day Streak</div>
+            </div>
+        </div>
+        
+        <div class="entries-section">
+            <div class="entries-list" id="entriesList">
+                <!-- Entries will be loaded here -->
+            </div>
+            
+            <div class="entry-form">
+                <h2 id="formTitle">New Entry</h2>
+                <form id="entryForm">
+                    <input type="hidden" id="entryId">
+                    <div class="form-group">
+                        <label class="form-label">Title</label>
+                        <input type="text" class="form-input" id="entryTitle" placeholder="Entry title" required>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Content</label>
+                        <textarea class="form-textarea" id="entryContent" placeholder="Write your thoughts here..." required></textarea>
+                    </div>
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label class="form-label">Mood</label>
+                            <select class="form-select" id="entryMood">
+                                <option value="happy">😊 Happy</option>
+                                <option value="sad">😢 Sad</option>
+                                <option value="excited">🤩 Excited</option>
+                                <option value="calm">😌 Calm</option>
+                                <option value="anxious">😰 Anxious</option>
+                                <option value="neutral" selected>😐 Neutral</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Tags (comma separated)</label>
+                            <input type="text" class="form-input" id="entryTags" placeholder="work, personal, goals">
+                        </div>
+                    </div>
+                    <div class="actions">
+                        <button type="submit" class="btn">Save Entry</button>
+                        <button type="button" class="btn btn-secondary" id="cancelEdit">Cancel</button>
+                        <button type="button" class="btn logout-btn" id="deleteEntry" style="display: none;">Delete</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
 
-async function api(method,url,body){{var opts={{method,headers:{{"Content-Type":"application/json"}}}};if(body)opts.body=JSON.stringify(body);try{{var r=await fetch(url,opts);return await r.json()}}catch(e){{return{{success:false,message:e.message}}}}}}
+    <script>
+        let currentEntry = null;
+        
+        document.addEventListener('DOMContentLoaded', function() {
+            loadStats();
+            loadEntries();
+            
+            document.getElementById('entryForm').addEventListener('submit', handleSaveEntry);
+            document.getElementById('cancelEdit').addEventListener('click', resetForm);
+            document.getElementById('deleteEntry').addEventListener('click', handleDeleteEntry);
+        });
+        
+        async function loadStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const data = await response.json();
+                
+                if (data.success) {
+                    document.getElementById('totalEntries').textContent = data.totalEntries;
+                    document.getElementById('totalWords').textContent = data.totalWords.toLocaleString();
+                    document.getElementById('streak').textContent = data.streak;
+                }
+            } catch (error) {
+                console.error('Error loading stats:', error);
+            }
+        }
+        
+        async function loadEntries() {
+            try {
+                const response = await fetch('/api/entries');
+                const data = await response.json();
+                
+                if (data.success) {
+                    const container = document.getElementById('entriesList');
+                    container.innerHTML = '';
+                    
+                    if (data.entries.length === 0) {
+                        container.innerHTML = '<div class="entry-item">No entries yet. Create your first entry!</div>';
+                        return;
+                    }
+                    
+                    data.entries.forEach(entry => {
+                        const div = document.createElement('div');
+                        div.className = 'entry-item';
+                        div.innerHTML = `
+                            <div class="entry-title">${escapeHtml(entry.title)}</div>
+                            <div class="entry-date">${new Date(entry.createdAt).toLocaleDateString()}</div>
+                            <div class="entry-preview">${escapeHtml(entry.content.substring(0, 100))}${entry.content.length > 100 ? '...' : ''}</div>
+                        `;
+                        div.addEventListener('click', () => editEntry(entry));
+                        container.appendChild(div);
+                    });
+                }
+            } catch (error) {
+                console.error('Error loading entries:', error);
+            }
+        }
+        
+        function editEntry(entry) {
+            currentEntry = entry;
+            document.getElementById('formTitle').textContent = 'Edit Entry';
+            document.getElementById('entryId').value = entry.id;
+            document.getElementById('entryTitle').value = entry.title;
+            document.getElementById('entryContent').value = entry.content;
+            document.getElementById('entryMood').value = entry.mood;
+            document.getElementById('entryTags').value = entry.tags.join(', ');
+            document.getElementById('deleteEntry').style.display = 'inline-block';
+        }
+        
+        function resetForm() {
+            document.getElementById('formTitle').textContent = 'New Entry';
+            document.getElementById('entryForm').reset();
+            document.getElementById('entryId').value = '';
+            document.getElementById('deleteEntry').style.display = 'none';
+            currentEntry = null;
+        }
+        
+        async function handleSaveEntry(e) {
+            e.preventDefault();
+            
+            const id = document.getElementById('entryId').value;
+            const title = document.getElementById('entryTitle').value.trim();
+            const content = document.getElementById('entryContent').value.trim();
+            const mood = document.getElementById('entryMood').value;
+            const tags = document.getElementById('entryTags').value
+                .split(',')
+                .map(tag => tag.trim())
+                .filter(tag => tag !== '');
+            
+            if (!title || !content) {
+                alert('Title and content are required');
+                return;
+            }
+            
+            const entryData = { title, content, mood, tags };
+            
+            try {
+                let response;
+                if (id) {
+                    // Update existing entry
+                    response = await fetch(`/api/entries/${id}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(entryData)
+                    });
+                } else {
+                    // Create new entry
+                    response = await fetch('/api/entries', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(entryData)
+                    });
+                }
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    resetForm();
+                    loadEntries();
+                    loadStats();
+                } else {
+                    alert(result.message || 'Error saving entry');
+                }
+            } catch (error) {
+                console.error('Error saving entry:', error);
+                alert('Network error. Please try again.');
+            }
+        }
+        
+        async function handleDeleteEntry() {
+            if (!currentEntry) return;
+            
+            if (!confirm('Are you sure you want to delete this entry?')) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/entries/${currentEntry.id}`, {
+                    method: 'DELETE'
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    resetForm();
+                    loadEntries();
+                    loadStats();
+                } else {
+                    alert(result.message || 'Error deleting entry');
+                }
+            } catch (error) {
+                console.error('Error deleting entry:', error);
+                alert('Network error. Please try again.');
+            }
+        }
+        
+        async function handleLogout() {
+            try {
+                await fetch('/api/auth/logout', { method: 'POST' });
+                window.location.href = '/';
+            } catch (error) {
+                window.location.href = '/';
+            }
+        }
+        
+        function escapeHtml(text) {
+            const map = {
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            };
+            return text.replace(/[&<>"']/g, m => map[m]);
+        }
+    </script>
+</body>
+</html>"""
+        self.wfile.write(html_content.encode('utf-8'))
+    
+    def handle_login(self, post_data):
+        try:
+            data = json.loads(post_data)
+            password = data.get('password', '')
+            client_ip = self.client_address[0]
+            now = datetime.now()
+            
+            attempts = login_attempts.get(client_ip, {"count": 0, "timestamp": now})
+            
+            if now - attempts["timestamp"] > LOCKOUT_DURATION:
+                login_attempts.pop(client_ip, None)
+                attempts = {"count": 0, "timestamp": now}
+            elif attempts["count"] >= MAX_LOGIN_ATTEMPTS:
+                remaining = int((LOCKOUT_DURATION - (now - attempts["timestamp"])).total_seconds() / 60) + 1
+                self.send_error_response(429, {"success": False, "message": f"Too many attempts. Try again in {remaining} min."})
+                return
+                
+            if password == PANEL_PASSWORD:
+                session_id = generate_session_id()
+                sessions[session_id] = {
+                    'authenticated': True,
+                    'created_at': datetime.now()
+                }
+                
+                self.send_response(200)
+                self.send_header('Set-Cookie', f'session_id={session_id}; Path=/; HttpOnly; SameSite=Strict')
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+                
+                login_attempts.pop(client_ip, None)
+            else:
+                attempts["count"] += 1
+                attempts["timestamp"] = now
+                login_attempts[client_ip] = attempts
+                remaining_attempts = MAX_LOGIN_ATTEMPTS - attempts['count']
+                self.send_error_response(401, {"success": False, "message": f"Invalid password. Attempts left: {remaining_attempts}"})
+        except Exception as e:
+            self.send_error_response(400, {"success": False, "message": "Invalid request"})
+    
+    def handle_logout(self):
+        cookie_header = self.headers.get('Cookie')
+        if cookie_header:
+            cookies = {}
+            for cookie in cookie_header.split(';'):
+                if '=' in cookie:
+                    key, value = cookie.strip().split('=', 1)
+                    cookies[key] = value
+            session_id = cookies.get('session_id')
+            if session_id and session_id in sessions:
+                del sessions[session_id]
+        
+        self.send_response(200)
+        self.send_header('Set-Cookie', 'session_id=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT')
+        self.send_header('Content-type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps({"success": True}).encode('utf-8'))
+    
+    def handle_get_entries(self):
+        data = load_data()
+        entries = sorted(data["entries"], key=lambda x: x["createdAt"], reverse=True)
+        self.send_json_response(200, {"success": True, "entries": entries})
+    
+    def handle_create_entry(self, post_data):
+        data = load_data()
+        try:
+            body = json.loads(post_data)
+            title = (body.get("title") or "").strip()
+            content = (body.get("content") or "").strip()
+            mood = body.get("mood") or "neutral"
+            tags = body.get("tags") or []
+            
+            if not title or not content:
+                self.send_error_response(400, {"success": False, "message": "Title and content required"})
+                return
+                
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+                
+            entry = {
+                "id": data["nextId"],
+                "title": title,
+                "content": content,
+                "mood": mood,
+                "tags": tags,
+                "wordCount": len(content.split()),
+                "createdAt": datetime.now().isoformat(),
+                "updatedAt": datetime.now().isoformat()
+            }
+            data["nextId"] += 1
+            data["entries"].append(entry)
+            save_data(data)
+            self.send_json_response(200, {"success": True, "entry": entry})
+        except Exception as e:
+            self.send_error_response(400, {"success": False, "message": "Invalid request"})
+    
+    def handle_update_entry(self, path, put_data):
+        try:
+            entry_id = int(path.split('/')[-1])
+            data = load_data()
+            entry = next((e for e in data["entries"] if e["id"] == entry_id), None)
+            if not entry:
+                self.send_error_response(404, {"success": False, "message": "Entry not found"})
+                return
+                
+            body = json.loads(put_data)
+            if "title" in body: entry["title"] = str(body["title"]).strip()
+            if "content" in body:
+                entry["content"] = str(body["content"]).strip()
+                entry["wordCount"] = len(entry["content"].split())
+            if "mood" in body: entry["mood"] = body["mood"]
+            if "tags" in body:
+                tags = body["tags"]
+                entry["tags"] = tags if isinstance(tags, list) else [t.strip() for t in str(tags).split(",") if t.strip()]
+                
+            entry["updatedAt"] = datetime.now().isoformat()
+            save_data(data)
+            self.send_json_response(200, {"success": True, "entry": entry})
+        except Exception as e:
+            self.send_error_response(400, {"success": False, "message": "Invalid request"})
+    
+    def handle_delete_entry(self, path):
+        try:
+            entry_id = int(path.split('/')[-1])
+            data = load_data()
+            idx = next((i for i, e in enumerate(data["entries"]) if e["id"] == entry_id), -1)
+            if idx == -1:
+                self.send_error_response(404, {"success": False, "message": "Entry not found"})
+                return
+                
+            data["entries"].pop(idx)
+            save_data(data)
+            self.send_json_response(200, {"success": True})
+        except Exception as e:
+            self.send_error_response(400, {"success": False, "message": "Invalid request"})
+    
+    def handle_entry_operations(self, path, post_data):
+        # This handles cases where we need to simulate PUT/DELETE via POST
+        method_override = self.headers.get('X-HTTP-Method-Override', '').upper()
+        if method_override == 'PUT':
+            self.handle_update_entry(path, post_data)
+        elif method_override == 'DELETE':
+            self.handle_delete_entry(path)
+        else:
+            self.send_error(404)
+    
+    def handle_get_stats(self):
+        data = load_data()
+        entries = data["entries"]
+        total_words = sum(e.get("wordCount", 0) for e in entries)
+        
+        mood_counts = {}
+        tag_counts = {}
+        dates = []
+        
+        for e in entries:
+            m = e.get("mood")
+            mood_counts[m] = mood_counts.get(m, 0) + 1
+            for t in e.get("tags", []):
+                tag_counts[t] = tag_counts.get(t, 0) + 1
+            dates.append(e["createdAt"][:10])
+            
+        dates.sort()
+        streak = 0
+        if dates:
+            today = datetime.now().strftime("%Y-%m-%d")
+            d = datetime.strptime(today, "%Y-%m-%d")
+            while d.strftime("%Y-%m-%d") in dates:
+                streak += 1
+                d -= timedelta(days=1)
+                
+        self.send_json_response(200, {
+            "success": True,
+            "totalEntries": len(entries),
+            "totalWords": total_words,
+            "streak": streak,
+            "moodCounts": mood_counts,
+            "tagCounts": tag_counts
+        })
 
-async function loadEntries(){{var d=await api("GET","/api/entries");if(!d.success)return;allEntries=d.entries||[];renderList();updateStats();}}
-
-function renderList(filter){{var list=document.getElementById("entryList");var filtered=allEntries;if(activeTag){{filtered=filtered.filter(function(e){{return(e.tags||[]).indexOf(activeTag)!==-1}})}}if(filter){{var q=filter.toLowerCase();filtered=filtered.filter(function(e){{return e.title.toLowerCase().indexOf(q)!==-1||e.content.toLowerCase().indexOf(q)!==-1}})}}
-var html="";if(filtered.length===0){{html='<div class="text-center text-slate-600 text-xs py-8">No entries found</div>'}}
-filtered.forEach(function(e){{var cls="entry-item rounded-xl p-3"+(e.id===currentId?" active":"");
-html+='<div class="'+cls+'" onclick="viewEntry('+e.id+')">';
-html+='<div class="flex items-center gap-2 mb-1"><span class="text-sm '+moodCls(e.mood)+'">'+moodIcon(e.mood)+'</span><span class="text-sm font-bold text-white truncate">'+esc(e.title)+'</span></div>';
-html+='<div class="text-[10px] text-slate-500">'+fmtDate(e.createdAt)+'</div>';
-if(e.tags&&e.tags.length>0){{html+='<div class="mt-1">'+e.tags.slice(0,3).map(function(t){{return'<span class="tag">'+esc(t)+'</span>'}}).join("")+'</div>'}}
-html+='</div>'}});
-list.innerHTML=html;}}
-
-function renderTags(){{var tags={{}};allEntries.forEach(function(e){{(e.tags||[]).forEach(function(t){{tags[t]=(tags[t]||0)+1}})}});var el=document.getElementById("tagFilter");var html="";Object.keys(tags).sort(function(a,b){{return tags[b]-tags[a]}}).slice(0,10).forEach(function(t){{var cls=activeTag===t?"bg-emerald-600 text-white":"bg-slate-800 text-slate-400 cursor-pointer hover:bg-slate-700";html+='<span class="tag '+cls+'" onclick="toggleTag(\\''+esc(t)+'\\')">'+esc(t)+' ('+tags[t]+')</span>'}});if(activeTag){{html+='<span class="tag bg-red-900 text-red-300 cursor-pointer" onclick="toggleTag(null)">Clear</span>'}}el.innerHTML=html;}}
-
-function toggleTag(t){{activeTag=activeTag===t?null:t;renderList();renderTags();}}
-
-async function viewEntry(id){{currentId=id;var d=await api("GET","/api/entries");if(!d.success)return;var e=(d.entries||[]).find(function(x){{return x.id===id}});if(!e)return;
-document.getElementById("emptyView").classList.add("hidden");var v=document.getElementById("entryView");v.classList.remove("hidden");
-var html='<div class="glass rounded-2xl p-6 shadow-2xl">';
-html+='<div class="flex justify-between items-start mb-4">';
-html+='<div><h2 class="text-xl font-black text-white">'+esc(e.title)+'</h2>';
-html+='<div class="flex items-center gap-3 mt-1 text-xs text-slate-400">';
-html+='<span>'+fmtDate(e.createdAt)+' at '+fmtTime(e.createdAt)+'</span>';
-html+='<span class="'+moodCls(e.mood)+'">'+moodIcon(e.mood)+' '+esc(e.mood)+'</span>';
-html+='<span>'+e.wordCount+' words</span></div></div>';
-html+='<div class="flex gap-2">';
-html+='<button onclick="editEntry('+e.id+')" class="btn bg-blue-600 hover:bg-blue-500 px-3 py-1.5 rounded-lg text-xs font-bold text-white"><i class="fas fa-edit mr-1"></i>Edit</button>';
-html+='<button onclick="deleteEntry('+e.id+')" class="btn bg-red-600 hover:bg-red-500 px-3 py-1.5 rounded-lg text-xs font-bold text-white"><i class="fas fa-trash mr-1"></i>Delete</button>';
-html+='</div></div>';
-if(e.tags&&e.tags.length>0){{html+='<div class="mb-4">'+e.tags.map(function(t){{return'<span class="tag">'+esc(t)+'</span>'}}).join("")+'</div>'}}
-html+='<div class="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">'+esc(e.content)+'</div>';
-html+='</div>';
-v.innerHTML=html;renderList();renderTags();}}
-
-function openCompose(editId,title,content,mood,tags){{document.getElementById("composeModal").classList.remove("hidden");document.getElementById("cEditId").value=editId||"";document.getElementById("cTitle").value=title||"";document.getElementById("cContent").value=content||"";document.getElementById("cMood").value=mood||"neutral";document.getElementById("cTags").value=tags||"";document.getElementById("composeTitle").innerHTML=editId?'<i class="fas fa-edit text-blue-400 mr-2"></i>Edit Entry':'<i class="fas fa-pen-fancy text-emerald-400 mr-2"></i>New Entry';document.getElementById("cTitle").focus();}}
-function closeCompose(){{document.getElementById("composeModal").classList.add("hidden")}}
-
-async function editEntry(id){{var d=await api("GET","/api/entries");if(!d.success)return;var e=(d.entries||[]).find(function(x){{return x.id===id}});if(!e)return;openCompose(e.id,e.title,e.content,e.mood,(e.tags||[]).join(", "));}}
-
-async function saveEntry(){{var editId=document.getElementById("cEditId").value;var title=document.getElementById("cTitle").value.trim();var content=document.getElementById("cContent").value.trim();var mood=document.getElementById("cMood").value;var tags=document.getElementById("cTags").value.split(",").map(function(t){{return t.trim()}}).filter(Boolean);if(!title||!content){{alert("Title and content are required");return}}
-var d;if(editId){{d=await api("PUT","/api/entries/"+editId,{{title:title,content:content,mood:mood,tags:tags}})}}else{{d=await api("POST","/api/entries",{{title:title,content:content,mood:mood,tags:tags}})}}
-if(d.success){{closeCompose();loadEntries();if(d.entry)viewEntry(d.entry.id)}}else{{alert(d.message||"Save failed")}}}}
-
-async function deleteEntry(id){{if(!confirm("Delete this entry permanently?"))return;var d=await api("DELETE","/api/entries/"+id);if(d.success){{currentId=null;document.getElementById("entryView").classList.add("hidden");document.getElementById("emptyView").classList.remove("hidden");loadEntries()}}else{{alert(d.message)}}}}
-
-function searchEntries(q){{renderList(q)}}
-
-async function updateStats(){{var d=await api("GET","/api/stats");if(!d.success)return;document.getElementById("statEntries").textContent=d.totalEntries||0;document.getElementById("statWords").textContent=d.totalWords||0;document.getElementById("statStreak").textContent=d.streak||0;}}
-
-async function showStats(){{var d=await api("GET","/api/stats");if(!d.success)return;var html="";html+='<div class="grid grid-cols-3 gap-3 mb-4">';html+='<div class="text-center p-3 bg-slate-900 rounded-xl"><div class="text-2xl font-black text-emerald-400">'+(d.totalEntries||0)+'</div><div class="text-[10px] text-slate-500 uppercase">Entries</div></div>';html+='<div class="text-center p-3 bg-slate-900 rounded-xl"><div class="text-2xl font-black text-cyan-400">'+(d.totalWords||0)+'</div><div class="text-[10px] text-slate-500 uppercase">Words</div></div>';html+='<div class="text-center p-3 bg-slate-900 rounded-xl"><div class="text-2xl font-black text-purple-400">'+(d.streak||0)+'</div><div class="text-[10px] text-slate-500 uppercase">Day Streak</div></div>';html+='</div>';
-var mc=d.moodCounts||{{}};if(Object.keys(mc).length>0){{html+='<div class="mb-3"><div class="text-xs text-slate-400 mb-2 font-bold">Mood Distribution</div>';var maxMood=Math.max.apply(null,Object.values(mc));Object.keys(mc).forEach(function(m){{var pct=Math.round(mc[m]/maxMood*100);html+='<div class="flex items-center gap-2 mb-1"><span class="text-xs w-16 '+moodCls(m)+'">'+moodIcon(m)+' '+m+'</span><div class="flex-1 bg-slate-800 rounded-full h-2"><div class="bg-emerald-500 h-2 rounded-full" style="width:'+pct+'%"></div></div><span class="text-[10px] text-slate-500">'+mc[m]+'</span></div>'}});html+='</div>'}}
-var tc=d.tagCounts||{{}};var topTags=Object.entries(tc).sort(function(a,b){{return b[1]-a[1]}}).slice(0,8);if(topTags.length>0){{html+='<div><div class="text-xs text-slate-400 mb-2 font-bold">Top Tags</div><div class="flex flex-wrap gap-1">';topTags.forEach(function(t){{html+='<span class="tag">'+esc(t[0])+' ('+t[1]+')</span>'}});html+='</div></div>'}}
-document.getElementById("statsContent").innerHTML=html;document.getElementById("statsModal").classList.remove("hidden")}}
-
-async function logout(){{var d=await api("POST","/api/auth/logout");if(d.success)window.location.href="/";}}
-
-loadEntries();
-</script></body></html>"""
-
-# ============================================================================
-# Run Server
-# ============================================================================
+def run_server():
+    server = HTTPServer(('0.0.0.0', PORT), JournalRequestHandler)
+    print(f"InkWell Journal App started on port {PORT}")
+    print(f"Access the app at: http://localhost:{PORT}")
+    server.serve_forever()
 
 if __name__ == "__main__":
-    print(f"Starting InkWell v{APP_VERSION} on port {PORT}...")
-    # 禁用 Flask 默认的请求日志以保持终端整洁（可选）
-    import logging
-    log = logging.getLogger('werkzeug')
-    log.setLevel(logging.ERROR)
-    
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    print("Starting InkWell Journal Application...")
+    run_server()
